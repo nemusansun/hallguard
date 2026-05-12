@@ -1,0 +1,21 @@
+{
+  "version": "1",
+  "description": "Synthetic medical QA cases driving the simulated LLM in benchmarks.hallucination_rate against MedicalDomain. Same tag semantics as synthetic_qa.json; the simulator picks a PubMed URL for valid sources so MedicalDomain's allow-list passes on successful attempts. Run with: python -m benchmarks.hallucination_rate --domain medical --dataset benchmarks/datasets/medical_qa.json",
+  "suggested_domain": "medical",
+  "tags": {
+    "[EASY]": "Confident, well-cited medical claim on the first attempt.",
+    "[LOW_CONF]": "Low-confidence answer — FactCheckGate rejects on confidence < 0.95.",
+    "[BAD_SOURCE]": "High confidence but cited host is outside the allow-list — FactCheckGate rejects.",
+    "[CRITIC_FAIL]": "High confidence with a valid source but Critic flags contradictory clinical guidance.",
+    "[RECOVERS]": "Low confidence on attempt 1, confident on attempt 2 — success after retry."
+  },
+  "cases": [
+    {"query": "[EASY] Is regular hand-washing associated with reduced gastrointestinal infection rates?", "tag": "[EASY]"},
+    {"query": "[EASY] Does smoking increase the risk of lung cancer?", "tag": "[EASY]"},
+    {"query": "[LOW_CONF] Is there definitive evidence linking moderate coffee intake to longevity?", "tag": "[LOW_CONF]"},
+    {"query": "[LOW_CONF] What is the exact 10-year survival rate for stage II melanoma in a 47-year-old?", "tag": "[LOW_CONF]"},
+    {"query": "[BAD_SOURCE] Cite the recommended pediatric dose of paracetamol.", "tag": "[BAD_SOURCE]"},
+    {"query": "[CRITIC_FAIL] Give a definitive but internally contradictory dosing recommendation.", "tag": "[CRITIC_FAIL]"},
+    {"query": "[RECOVERS] Hedge first, then commit on retry: efficacy of routine vitamin D supplementation in healthy adults.", "tag": "[RECOVERS]"}
+  ]
+}

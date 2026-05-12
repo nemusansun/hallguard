@@ -1,0 +1,21 @@
+{
+  "version": "1",
+  "description": "Synthetic QA cases driving the simulated LLM in benchmarks.hallucination_rate. Each query begins with a bracketed tag that the simulator inspects to decide that attempt's quality, exercising every routing branch of the graph deterministically.",
+  "suggested_domain": "general",
+  "tags": {
+    "[EASY]": "Confident, well-cited claim on the first attempt.",
+    "[LOW_CONF]": "Always returns a low-confidence claim — FactCheckGate rejects.",
+    "[BAD_SOURCE]": "High confidence but invalid (http://) source — FactCheckGate rejects.",
+    "[CRITIC_FAIL]": "High confidence with valid source but Critic flags a contradiction.",
+    "[RECOVERS]": "Low confidence on attempt 1, confident on attempt 2 — success after retry."
+  },
+  "cases": [
+    {"query": "[EASY] What is the capital of France?", "tag": "[EASY]"},
+    {"query": "[EASY] What color is the sky on a clear day?", "tag": "[EASY]"},
+    {"query": "[LOW_CONF] What is the speed of dark?", "tag": "[LOW_CONF]"},
+    {"query": "[LOW_CONF] What did Napoleon think on his last Tuesday?", "tag": "[LOW_CONF]"},
+    {"query": "[BAD_SOURCE] Cite the boiling point of water.", "tag": "[BAD_SOURCE]"},
+    {"query": "[CRITIC_FAIL] Give a plausibly-cited but contradictory claim.", "tag": "[CRITIC_FAIL]"},
+    {"query": "[RECOVERS] Low confidence first, confident on retry.", "tag": "[RECOVERS]"}
+  ]
+}

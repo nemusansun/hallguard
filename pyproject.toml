@@ -1,0 +1,65 @@
+[project]
+name = "hallguard"
+version = "0.8.2"
+description = "Deterministic, hallucination-resistant multi-agent framework with structured output, source grounding, confidence gates, and an independent critic loop."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "NamuGororo" },
+]
+keywords = [
+    "llm",
+    "hallucination",
+    "multi-agent",
+    "structured-output",
+    "rag",
+    "pydantic",
+    "langgraph",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+graph = [
+    "langgraph>=0.2.0",
+]
+openai = [
+    "openai>=1.0.0",
+]
+all = [
+    "langgraph>=0.2.0",
+    "openai>=1.0.0",
+]
+dev = [
+    "langgraph>=0.2.0",
+    "openai>=1.0.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.12.0",
+    "mypy>=1.8.0",
+]
+
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["hallucination_guard*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
