@@ -48,7 +48,10 @@ class StructuredNode:
             user=state.user_query,
             schema=self.domain.output_schema(),
         )
-        return state.with_update(research_output=output)
+        return state.with_update(
+            research_output=output,
+            branch_outputs=state.branch_outputs + [output],
+        )
 
     async def acall(self, state: GraphState) -> GraphState:
         """Async counterpart of :meth:`__call__`.
@@ -72,7 +75,10 @@ class StructuredNode:
                 user=state.user_query,
                 schema=self.domain.output_schema(),
             )
-        return state.with_update(research_output=output)
+        return state.with_update(
+            research_output=output,
+            branch_outputs=state.branch_outputs + [output],
+        )
 
     def _build_system(self, state: GraphState) -> str:
         base = self.domain.system_prompt()

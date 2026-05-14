@@ -6,7 +6,66 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.8.2] — 2026-05-12
+## [0.9.0] -- 2026-05-14
+
+### Added
+
+- **Parallel research mode.** `Graph(structured_llm=[llm_a, llm_b], ...)`
+  activates a fan-out / fan-in pipeline: a dispatch node sends the query
+  to N parallel `StructuredNode` invocations via LangGraph `Send`, an
+  `AggregatorNode` merges their outputs, and the rest of the pipeline
+  (FactCheckGate / CriticNode / retry loop) runs on the merged result.
+  Each retry re-dispatches all N researchers.
+- **`AggregatorNode`** (`hallucination_guard.nodes.aggregator`) merges
+  `branch_outputs` from parallel branches into a single `research_output`.
+  Default strategy concatenates all `.claims`; pass `merge_strategy=fn`
+  to `Graph(...)` for a custom merge.
+- **`Graph.is_parallel`** / **`Graph.num_researchers`** read-only
+  properties so callers can inspect the graph topology.
+- **`Annotated[list, operator.add]` reducer** on `GraphState.fail_history`
+  and the new `GraphState.branch_outputs` field. LangGraph now correctly
+  concatenates list entries from parallel nodes instead of overwriting.
+- **`GraphState.branch_outputs`** accumulates structured-output instances
+  from each StructuredNode invocation (serial or parallel). Used by
+  `AggregatorNode` to read the latest round's outputs.
+- **`GraphState.researcher_id`** identifies which parallel branch is
+  executing (defaults to 0 in serial mode).
+- **Reducer-aware `_wrap`**. `_build_update_dict` now returns only changed
+  fields for non-reducer channels and only the delta (newly appended items)
+  for reducer channels, preventing LangGraph's "multiple values per step"
+  errors under `Send` parallelism.
+- **`_wrap_parallel` / `_wrap_async_parallel`** wrappers that additionally
+  skip `research_output` (written by `AggregatorNode`, not by individual
+  branches) to avoid non-reducer channel collisions.
+- **`tests/test_reducer.py`** (8 tests) covering `_ADDITIVE_FIELDS`
+  detection, `_build_update_dict` delta computation, and `_merge_update`
+  additive behavior.
+- **`tests/test_parallel_graph.py`** (13 tests) covering `AggregatorNode`
+  unit tests, parallel `run` / `stream` / retry / `max_retries=0` /
+  custom `merge_strategy` / `fail_history` preservation.
+
+### Changed
+
+- `StructuredNode` now writes to `branch_outputs` in addition to
+  `research_output`. In serial mode the extra field is unused; in
+  parallel mode `AggregatorNode` reads it.
+- `_build_update_dict` emits only *changed* non-reducer fields and
+  *non-empty* reducer deltas, rather than the full state. This is a
+  prerequisite for `Send`-based parallelism and has no effect on serial
+  graph behavior.
+- `Graph.__init__` accepts `structured_llm` as a single client or a
+  list. A list activates parallel mode; a single client preserves the
+  existing serial pipeline with no topology change.
+
+### Migration notes
+
+- **No breaking changes for single-LLM callers.** `Graph(domain, slm, jlm)`
+  continues to work identically. The new `branch_outputs` and
+  `researcher_id` fields on `GraphState` default to `[]` and `0`
+  respectively and are ignored by the serial pipeline.
+- Custom code that inspects the raw dict returned by `_wrap` may see
+  fewer keys (only changed fields are included now). This is an internal
+  API; public callers should not be affected.
 
 ### Changed
 

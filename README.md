@@ -36,6 +36,28 @@ FactCheckGate          ← DomainConfig.confidence_threshold / is_valid_source
         └─ PASS ──▶ FinalOutput
 ```
 
+`structured_llm` にリストを渡すと並行モードになり、`StructuredNode` の前段が
+fan-out / fan-in トポロジに切り替わります:
+
+```
+Input
+  │
+  ▼
+Dispatch ──Send──▶ StructuredNode #0 ─┐
+         ──Send──▶ StructuredNode #1 ─┤
+         ──Send──▶ StructuredNode #N ─┤
+                                      ▼
+                              AggregatorNode  ← merge_strategy で合成
+                                      │
+                                      ▼
+                              FactCheckGate 以降は同じ
+```
+
+各ブランチの出力は `branch_outputs` reducer フィールド
+(`Annotated[list, operator.add]`) に蓄積され、`AggregatorNode` が現ラウンドの
+末尾 N 件だけを取り出して `research_output` に合成します。リトライ時は
+`RetryNode → Dispatch` で全ブランチが再 fan-out されます。
+
 ---
 
 ## ディレクトリ構成
@@ -56,6 +78,7 @@ hallguard/
 │   │   ├── factcheck_gate.py   ← confidence / source 検証
 │   │   ├── critic_node.py      ← 独立判定 + final_output 確定
 │   │   ├── retry_node.py       ← retry_count++ / 信号リセット
+│   │   ├── aggregator.py       ← 並行ブランチの branch_outputs を合成
 │   │   └── error_output.py     ← max_retries 超過時の終端
 │   ├── domain/
 │   │   ├── base.py         ← DomainConfig 抽象クラス
@@ -75,6 +98,9 @@ hallguard/
 │   ├── test_critic_node.py
 │   ├── test_retry_node.py
 │   ├── test_error_output.py
+│   ├── test_reducer.py            ← _wrap / _merge_update のデルタ挙動
+│   ├── test_parallel_graph.py     ← fan-out / fan-in / Aggregator の統合
+│   ├── test_parallel_checkpointer.py ← 並行モード × LangGraph checkpointer
 │   └── test_graph_integration.py
 ├── examples/
 │   └── research_agent.py   ← Graph をモック LLM で回すデモ
@@ -151,7 +177,7 @@ deactivate    # 抜けるとき
 .venv/bin/python -m pytest tests/ -v
 ```
 
-193 件 passing。内訳:
+223 件 passing。内訳:
 
 - **ノード単体** (`test_state.py` / `test_structured_node.py` /
   `test_factcheck_gate.py` / `test_critic_node.py` / `test_retry_node.py` /
@@ -162,6 +188,16 @@ deactivate    # 抜けるとき
   sync↔async フォールバック / `asyncio.wait_for` / 明示キャンセル /
   `asyncio.Semaphore(32)` 下の fan-out で state 分離と `fail_history`
   非共有を検証
+- **並行モード** (`test_reducer.py` 8 件 / `test_parallel_graph.py` 13 件 /
+  `test_parallel_checkpointer.py` 10 件、計 31 件) —
+  `_ADDITIVE_FIELDS` 自動検出 / `_build_update_dict` の delta-only +
+  changed-only / `_merge_update` の reducer 適用 / `Send` 経由の fan-out
+  で `fail_history` が上書きロストしないこと / リトライ間の
+  `branch_outputs` 累積から末尾 N 件を切り出す `AggregatorNode` /
+  カスタム `merge_strategy` / 空 list 拒否 / checkpointer 経由の
+  `branch_outputs` round-trip / `build_serializer()` 無警告 /
+  `auto_serialize=True` / スレッド分離 / リトライ累積の永続化 /
+  resume 時の Pydantic インスタンス保持 / `num_researchers` スケーリング
 - **ドメイン** (`test_general_domain.py` 19 件 / `test_medical_domain.py`
   22 件) — `locale="ja"` 込み。Medical は `_ALLOWED_HOSTS` ↔ retry
   テンプレ整合性も
@@ -179,7 +215,7 @@ deactivate    # 抜けるとき
 .venv/bin/mypy hallucination_guard/
 ```
 
-`Success: no issues found in 24 source files` が出れば OK。
+`Success: no issues found in 23 source files` が出れば OK。
 
 ### デモ実行
 
@@ -286,6 +322,47 @@ graph = Graph(
 （デフォルトを設けないことで、誤ったモデルが裏で使われる事故を防ぐ）。
 Structured Outputs（`chat.completions.parse` + `response_format=<Pydantic class>`）
 を内部で使うため、対応モデルが必要です。
+
+### 並行リサーチ（複数 LLM を fan-out）
+
+`structured_llm` に複数のクライアントをリストで渡すと、`StructuredNode`
+が `Send` で fan-out され、結果が `AggregatorNode` でマージされます。
+パイプラインの後段（FactCheckGate / CriticNode / Retry）は単一 LLM 時と
+共通で、リトライ時は全ブランチが再 dispatch されます。
+
+```python
+graph = Graph(
+    domain=GeneralDomain(),
+    structured_llm=[adapter_a, adapter_b, adapter_c],   # N >= 2 で並行モード
+    judge_llm=MyJudgeLLM(),
+)
+result = graph.run("What is the capital of France?")
+
+graph.is_parallel       # True
+graph.num_researchers   # 3
+len(result.branch_outputs)  # 各ラウンドで N 件ずつ蓄積される
+```
+
+デフォルトのマージ戦略は全ブランチの `claims` を連結した `GroundedOutput`
+を返します。別の戦略に差し替えたい場合は `merge_strategy` に
+`(list[Any]) -> Any` を渡します:
+
+```python
+def majority_vote(outputs: list[GroundedOutput]) -> GroundedOutput:
+    ...
+
+graph = Graph(
+    domain=GeneralDomain(),
+    structured_llm=[a, b, c],
+    judge_llm=MyJudgeLLM(),
+    merge_strategy=majority_vote,
+)
+```
+
+`merge_strategy` は並行モードでのみ意味を持ち、単一クライアント時は無視
+されます。空リスト `structured_llm=[]` は `ValueError` で即拒否されます。
+非同期クライアントを混ぜた場合の判定は単一モードと同じで、いずれかが
+async-only なら全体が async-native 経路に切り替わります。
 
 ### State を永続化する（checkpointer）
 

@@ -7,7 +7,7 @@ the retry path (a first-attempt low-confidence answer is rejected, the
 retry directive nudges the LLM toward a confident citation, and the second
 attempt passes both the gate and the critic).
 
-Five demos are emitted:
+Six demos are emitted:
 
 1. ``Graph.run()`` — retry-then-success.
 2. ``Graph.run()`` — exhausted retries falling back to ``ErrorOutput``.
@@ -17,6 +17,9 @@ Five demos are emitted:
 5. ``Graph.arun()`` driven by a native :class:`AsyncStructuredLLM` client,
    showing how a vendor SDK exposing ``async`` methods plugs into the
    framework with no bridging.
+6. Parallel research — two ``StructuredLLM`` clients fan out via ``Send``
+   and the ``AggregatorNode`` merges their claims into a single output
+   before the FactCheckGate runs.
 
 Run me with:
 
@@ -121,6 +124,33 @@ class _AsyncDemoJudgeLLM:
         return CriticVerdict(verdict="PASS")
 
 
+class _PersonaStructuredLLM:
+    """Returns a single confident claim tagged with a researcher persona.
+
+    Used by the parallel demo so each fan-out branch contributes a
+    distinguishable claim and the merged ``GroundedOutput`` visibly carries
+    contributions from every researcher.
+    """
+
+    def __init__(self, persona: str, claim_text: str, source: str) -> None:
+        self._persona = persona
+        self._claim_text = claim_text
+        self._source = source
+
+    def generate(
+        self, *, system: str, user: str, schema: type[BaseModel]
+    ) -> BaseModel:
+        return GroundedOutput(
+            claims=[
+                Claim(
+                    text=f"[{self._persona}] {self._claim_text}",
+                    confidence=0.95,
+                    sources=[self._source],
+                )
+            ]
+        )
+
+
 def _report(result: GraphState) -> None:
     print(f"  success      : {result.is_success}")
     print(f"  retry_count  : {result.retry_count}")
@@ -216,6 +246,34 @@ def main() -> None:
         return await async_native_graph.arun("What is the capital of France?")
 
     _report(asyncio.run(_drive_async_native()))
+
+    print()
+    print("== demo 6: parallel research with two StructuredLLM clients ==")
+    encyclopedist = _PersonaStructuredLLM(
+        persona="encyclopedist",
+        claim_text="Paris has been the capital of France since 987 AD",
+        source="https://en.wikipedia.org/wiki/Paris",
+    )
+    geographer = _PersonaStructuredLLM(
+        persona="geographer",
+        claim_text="Paris sits on the Seine in the Île-de-France region",
+        source="https://en.wikipedia.org/wiki/%C3%8Ele-de-France",
+    )
+    parallel_graph = Graph(
+        domain=GeneralDomain(),
+        structured_llm=[encyclopedist, geographer],
+        judge_llm=_DemoJudgeLLM(),
+    )
+    print(
+        f"  is_parallel    : {parallel_graph.is_parallel} "
+        f"(num_researchers={parallel_graph.num_researchers})"
+    )
+    parallel_result = parallel_graph.run("Tell me about Paris.")
+    _report(parallel_result)
+    print(f"  branch_outputs : {len(parallel_result.branch_outputs)} entries")
+    if parallel_result.research_output is not None:
+        for claim in parallel_result.research_output.claims:
+            print(f"    - {claim.text}")
 
 
 if __name__ == "__main__":

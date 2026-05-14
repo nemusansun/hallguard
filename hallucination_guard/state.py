@@ -7,12 +7,20 @@ forbidden by convention.
 ``fail_history`` entries follow the convention ``"<FailReason.value>:<detail>"``
 so that :meth:`GraphState.get_rejected_claims` can pull out only the claims that
 were rejected by the CriticNode.
+
+List fields annotated with ``Annotated[list, operator.add]`` are **reducer
+fields**: when LangGraph merges updates from parallel nodes it concatenates
+the returned delta with the existing list instead of replacing it. Node
+callables may continue to use the ``state.field + additions`` concat pattern
+internally — the ``_wrap`` adapter in ``graph.py`` computes the delta
+automatically before handing the dict to LangGraph.
 """
 
 from __future__ import annotations
 
+import operator
 from enum import Enum
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -34,10 +42,16 @@ class GraphState(BaseModel):
 
     user_query: str
     research_output: Optional[Any] = None
+    branch_outputs: Annotated[list[Any], operator.add] = Field(
+        default_factory=list,
+    )
+    researcher_id: int = 0
     retry_count: int = 0
     max_retries: int = 3
     fail_reason: Optional[FailReason] = None
-    fail_history: list[str] = Field(default_factory=list)
+    fail_history: Annotated[list[str], operator.add] = Field(
+        default_factory=list,
+    )
     gate_result: Optional[Literal["PASS", "FAIL"]] = None
     critic_result: Optional[Literal["PASS", "FAIL"]] = None
     is_success: bool = False
