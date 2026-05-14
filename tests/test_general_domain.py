@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from hallucination_guard.domain.general import GeneralDomain
 from hallucination_guard.retry.directive import RetryDirective
 from hallucination_guard.schemas import GroundedOutput
+from hallucination_guard.state import FailReason
 
 
 @pytest.fixture
@@ -138,9 +139,21 @@ def test_japanese_locale_retry_directive_lists_forbidden_claims() -> None:
     assert "- 主張ベータ" in prompt
 
 
-def test_retry_locale_matches_constructor_locale() -> None:
-    """``retry_locale()`` mirrors the locale used at construction so the
-    hint builder picks the matching ``INSTRUCTION_MAPS`` entry."""
-    assert GeneralDomain().retry_locale() == "en"
-    assert GeneralDomain(locale="en").retry_locale() == "en"
-    assert GeneralDomain(locale="ja").retry_locale() == "ja"
+@pytest.mark.parametrize("reason", list(FailReason))
+def test_retry_instruction_covers_every_fail_reason(reason: FailReason) -> None:
+    """Each :class:`FailReason` resolves to a non-empty instruction in both locales."""
+    en = GeneralDomain(locale="en").retry_instruction(reason)
+    ja = GeneralDomain(locale="ja").retry_instruction(reason)
+    assert en and ja
+
+
+@pytest.mark.parametrize("reason", list(FailReason))
+def test_retry_instruction_differs_between_locales(reason: FailReason) -> None:
+    """Each ``FailReason`` has a distinct phrase per locale.
+
+    Guards against accidentally collapsing the two locale maps into a single
+    language and silently regressing localized prompts.
+    """
+    en = GeneralDomain(locale="en").retry_instruction(reason)
+    ja = GeneralDomain(locale="ja").retry_instruction(reason)
+    assert en != ja

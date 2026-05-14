@@ -1,6 +1,6 @@
 [project]
 name = "hallguard"
-version = "0.9.0"
+version = "0.10.0"
 description = "Deterministic, hallucination-resistant multi-agent framework with structured output, source grounding, confidence gates, and an independent critic loop."
 readme = "README.md"
 requires-python = ">=3.11"

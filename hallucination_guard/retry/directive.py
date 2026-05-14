@@ -16,7 +16,7 @@ class RetryDirective(BaseModel):
     Attributes:
         fix_instruction: A fixed, hand-authored sentence describing what the
             next attempt must do differently. Sourced only from
-            ``RetryHintBuilder.INSTRUCTION_MAP``.
+            :meth:`DomainConfig.retry_instruction`.
         forbidden_claims: Claims previously rejected by the CriticNode that
             must not be repeated.
     """

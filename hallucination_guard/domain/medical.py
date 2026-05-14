@@ -5,6 +5,7 @@ A demonstration of how a domain can tighten the framework's safety knobs:
 - Confidence threshold raised to ``0.95``
 - Citations restricted to a small allow-list of well-known medical sources
 - Critic prompt that explicitly forbids unsupported clinical guidance
+- Retry-instruction wording tuned for clinical citations
 
 The allow-list is intentionally tiny; production deployments are expected
 to override it with their own institutional sources.
@@ -16,13 +17,18 @@ no change in behavior.
 
 from __future__ import annotations
 
+from typing import Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel
 
-from hallucination_guard.domain.base import DomainConfig, Locale
+from hallucination_guard.domain.base import DomainConfig
 from hallucination_guard.retry.directive import RetryDirective
 from hallucination_guard.schemas import GroundedOutput
+from hallucination_guard.state import FailReason
+
+
+Locale = Literal["en", "ja"]
 
 
 _ALLOWED_HOSTS = frozenset(
@@ -88,6 +94,37 @@ verdict=FAIL を返し、問題のある主張文を rejected_claims に原文�
 """
 
 
+_RETRY_INSTRUCTIONS: dict[Locale, dict[FailReason, str]] = {
+    "en": {
+        FailReason.LOW_CONFIDENCE: (
+            "State each clinical claim's confidence as a value in "
+            "[0.0, 1.0]; abstain rather than guess when evidence is weak."
+        ),
+        FailReason.NO_SOURCE: (
+            "Cite a peer-reviewed or institutional medical source "
+            "(PubMed, WHO, CDC, Cochrane, NEJM) for every clinical claim."
+        ),
+        FailReason.CRITIC_REJECTED: (
+            "Do not repeat any clinical claim that was rejected in a "
+            "previous attempt."
+        ),
+    },
+    "ja": {
+        FailReason.LOW_CONFIDENCE: (
+            "各臨床主張の確信度を0.0〜1.0で明示し、エビデンスが乏しい"
+            "場合は推測せず回答を控えてください"
+        ),
+        FailReason.NO_SOURCE: (
+            "臨床主張ごとに査読済みまたは公的医療機関の出典"
+            "(PubMed, WHO, CDC, Cochrane, NEJM)を引用してください"
+        ),
+        FailReason.CRITIC_REJECTED: (
+            "前回却下された臨床主張を繰り返さないでください"
+        ),
+    },
+}
+
+
 class MedicalDomain(DomainConfig):
     """Strict medical-question domain.
 
@@ -101,9 +138,6 @@ class MedicalDomain(DomainConfig):
 
     def __init__(self, *, locale: Locale = "en") -> None:
         self.locale: Locale = locale
-
-    def retry_locale(self) -> Locale:
-        return self.locale
 
     @property
     def confidence_threshold(self) -> float:
@@ -132,6 +166,9 @@ class MedicalDomain(DomainConfig):
         if self.locale == "ja":
             return _MEDICAL_SYSTEM_PROMPT_JA
         return _MEDICAL_SYSTEM_PROMPT_EN
+
+    def retry_instruction(self, fail_reason: FailReason) -> str:
+        return _RETRY_INSTRUCTIONS[self.locale][fail_reason]
 
     def format_retry_directive(
         self, base_prompt: str, directive: RetryDirective

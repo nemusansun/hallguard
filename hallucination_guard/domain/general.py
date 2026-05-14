@@ -2,7 +2,7 @@
 
 Suitable as a baseline for examples and tests. Stricter domains (medical,
 legal, …) should subclass :class:`DomainConfig` directly and tighten the
-confidence threshold, source allow-list, and critic prompt.
+confidence threshold, source allow-list, critic prompt, and retry wording.
 
 Set ``locale="ja"`` at construction time to swap the English prompts for
 their Japanese counterparts; default is ``"en"`` so existing callers see
@@ -11,13 +11,18 @@ no change in behavior.
 
 from __future__ import annotations
 
+from typing import Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel
 
-from hallucination_guard.domain.base import DomainConfig, Locale
+from hallucination_guard.domain.base import DomainConfig
 from hallucination_guard.retry.directive import RetryDirective
 from hallucination_guard.schemas import GroundedOutput
+from hallucination_guard.state import FailReason
+
+
+Locale = Literal["en", "ja"]
 
 
 _GENERAL_SYSTEM_PROMPT_EN = """\
@@ -59,6 +64,26 @@ _GENERAL_CRITIC_PROMPT_JA = """\
 """
 
 
+_RETRY_INSTRUCTIONS: dict[Locale, dict[FailReason, str]] = {
+    "en": {
+        FailReason.LOW_CONFIDENCE: (
+            "State each claim's confidence as a value in [0.0, 1.0]."
+        ),
+        FailReason.NO_SOURCE: (
+            "Attach at least one source URL to every claim."
+        ),
+        FailReason.CRITIC_REJECTED: (
+            "Do not repeat any claim that was rejected in a previous attempt."
+        ),
+    },
+    "ja": {
+        FailReason.LOW_CONFIDENCE: "各主張の確信度を0.0〜1.0で明示してください",
+        FailReason.NO_SOURCE: "主張ごとに出典URLを必ず添付してください",
+        FailReason.CRITIC_REJECTED: "前回否定された主張を繰り返さないでください",
+    },
+}
+
+
 class GeneralDomain(DomainConfig):
     """Permissive default domain.
 
@@ -71,9 +96,6 @@ class GeneralDomain(DomainConfig):
 
     def __init__(self, *, locale: Locale = "en") -> None:
         self.locale: Locale = locale
-
-    def retry_locale(self) -> Locale:
-        return self.locale
 
     @property
     def confidence_threshold(self) -> float:
@@ -100,6 +122,9 @@ class GeneralDomain(DomainConfig):
         if self.locale == "ja":
             return _GENERAL_SYSTEM_PROMPT_JA
         return _GENERAL_SYSTEM_PROMPT_EN
+
+    def retry_instruction(self, fail_reason: FailReason) -> str:
+        return _RETRY_INSTRUCTIONS[self.locale][fail_reason]
 
     def format_retry_directive(
         self, base_prompt: str, directive: RetryDirective

@@ -177,7 +177,7 @@ deactivate    # 抜けるとき
 .venv/bin/python -m pytest tests/ -v
 ```
 
-223 件 passing。内訳:
+229 件 passing。内訳:
 
 - **ノード単体** (`test_state.py` / `test_structured_node.py` /
   `test_factcheck_gate.py` / `test_critic_node.py` / `test_retry_node.py` /
@@ -198,16 +198,17 @@ deactivate    # 抜けるとき
   `branch_outputs` round-trip / `build_serializer()` 無警告 /
   `auto_serialize=True` / スレッド分離 / リトライ累積の永続化 /
   resume 時の Pydantic インスタンス保持 / `num_researchers` スケーリング
-- **ドメイン** (`test_general_domain.py` 19 件 / `test_medical_domain.py`
-  22 件) — `locale="ja"` 込み。Medical は `_ALLOWED_HOSTS` ↔ retry
-  テンプレ整合性も
+- **ドメイン** (`test_general_domain.py` 24 件 / `test_medical_domain.py`
+  28 件) — `locale="ja"` 込み、`retry_instruction` の各 `FailReason` 網羅
+  + locale 別の文言差分も。Medical は `_ALLOWED_HOSTS` ↔ retry テンプレ
+  整合性も
 - **その他** (`test_protocols.py` 6 / `test_openai_adapter.py` 9 /
-  `test_hint_builder.py` 12 / `test_serde.py` 11 /
-  `test_benchmark_smoke.py` 23、計 61 件) — `@runtime_checkable` の
+  `test_hint_builder.py` 7 / `test_serde.py` 11 /
+  `test_benchmark_smoke.py` 23、計 56 件) — `@runtime_checkable` の
   sync/async 判定、OpenAI Structured Outputs の in-memory fake、
-  `INSTRUCTION_MAPS["en"|"ja"]` parametrize、msgpack allow-list、
-  ベンチ CLI 引数群（`--async --concurrency N` の並列度上限・直列退行
-  検出を含む）
+  `RetryHintBuilder` がドメインに wording を委譲することを stub domain で
+  検証、msgpack allow-list、ベンチ CLI 引数群（`--async --concurrency N`
+  の並列度上限・直列退行検出を含む）
 
 ### 型チェック
 
@@ -215,7 +216,7 @@ deactivate    # 抜けるとき
 .venv/bin/mypy hallucination_guard/
 ```
 
-`Success: no issues found in 23 source files` が出れば OK。
+`Success: no issues found in 25 source files` が出れば OK。
 
 ### デモ実行
 
@@ -487,8 +488,9 @@ result = await graph.arun("Who painted Guernica?")
 ### 低レベル API（State / Retry 層）
 
 ```python
-from hallucination_guard.state import GraphState, FailReason
+from hallucination_guard.domain.general import GeneralDomain
 from hallucination_guard.retry.hint_builder import RetryHintBuilder
+from hallucination_guard.state import FailReason, GraphState
 
 # 1) イミュータブルな State
 state = GraphState(user_query="緑茶は癌を予防しますか？")
@@ -502,7 +504,8 @@ assert state.retry_count == 0
 assert next_state.retry_count == 1
 
 # 3) RetryDirective を組み立てる（プロンプト注入の唯一の入口）
-directive = RetryHintBuilder.build(next_state)
+domain = GeneralDomain(locale="ja")
+directive = RetryHintBuilder.build(next_state, domain)
 print(directive.fix_instruction)
 # → "主張ごとに出典URLを必ず添付してください"
 print(directive.forbidden_claims)
@@ -518,7 +521,7 @@ s = GraphState(
     fail_reason=FailReason.CRITIC_REJECTED,
     fail_history=["critic_rejected:緑茶は癌を治す"],
 )
-RetryHintBuilder.build(s).forbidden_claims
+RetryHintBuilder.build(s, domain).forbidden_claims
 # → ['緑茶は癌を治す']
 ```
 
@@ -546,17 +549,17 @@ state.retry_count += 1
 
 ```python
 # good
-directive = RetryHintBuilder.build(state)
+directive = RetryHintBuilder.build(state, domain)
 prompt = build_prompt(directive)
 
 # bad
 prompt = f"前回の失敗: {state.fail_history}"
 ```
 
-`RetryHintBuilder` は `INSTRUCTION_MAPS[locale]` の **固定文言** からのみ
-`fix_instruction` を生成します。動的な文字列は混入しません。`locale` は
-`DomainConfig.retry_locale()` 経由で `StructuredNode` から渡され、デフォルト
-は `"en"` です。
+`RetryHintBuilder` は wording を一切持ちません。`fix_instruction` は
+`DomainConfig.retry_instruction(fail_reason)` が返した **固定文言** を
+そのまま転送するだけで、動的な文字列は混入しません。文言の言語・対象
+読者・厳しさはすべてドメイン側の責務です。
 
 `StructuredNode` から見える retry プロンプトの組み立て窓口は
 `DomainConfig.format_retry_directive(base_prompt, directive)` です。
@@ -567,14 +570,15 @@ prompt = f"前回の失敗: {state.fail_history}"
 
 ビルトインの `GeneralDomain` / `MedicalDomain` は `locale="en"`（既定）と
 `locale="ja"` を受け付け、`system_prompt` / `critic_prompt` /
-`format_retry_directive` / `retry_locale` の 4 つを同時に切り替えます。
-これにより `RetryHintBuilder` が返す `fix_instruction` も locale に追従し、
-英語プロンプトに日本語の指示文が混入しません。`verdict=PASS` /
+`format_retry_directive` / `retry_instruction` の 4 つを同時に切り替えます。
+英語プロンプトに日本語の指示文が混入することはありません。`verdict=PASS` /
 `verdict=FAIL` などの構造化出力マーカーや出典ブランド名（PubMed, WHO,
 CDC, Cochrane, NEJM）は、日本語版でも ASCII のまま保たれ、ホスト
 allow-list や `CriticVerdict` のパースを壊さない設計です。`Locale` 型
-（`Literal["en", "ja"]`）は `hallucination_guard.domain.base.Locale` から
-import できます。
+（`Literal["en", "ja"]`）はビルトインドメイン専用で、
+`hallucination_guard.domain.general.Locale` ／
+`hallucination_guard.domain.medical.Locale` から import できます
+（フレームワーク本体は locale を知りません）。
 
 ### 3. ドメイン知識をフレームワーク本体に書かない
 

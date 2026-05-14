@@ -6,6 +6,59 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-05-14
+
+### Changed
+
+- **Retry-instruction wording moved out of the framework.** Every
+  `DomainConfig` subclass must now implement
+  `retry_instruction(fail_reason: FailReason) -> str`. `RetryHintBuilder`
+  no longer ships a hardcoded phrase map; it forwards
+  `state.fail_reason` to the active domain and packages the returned
+  string into `RetryDirective.fix_instruction`. This finishes the
+  framework-vs-domain separation the Strategy pattern was meant to
+  enforce.
+- **`RetryHintBuilder.build` signature.** Now takes the domain
+  positionally: `RetryHintBuilder.build(state, domain)`. The previous
+  `locale=` keyword and the `INSTRUCTION_MAPS` class attribute have
+  been removed.
+- **Built-in domains own their wording.** `GeneralDomain` and
+  `MedicalDomain` keep both English and Japanese phrasings in
+  module-private `_RETRY_INSTRUCTIONS` maps and return entries via
+  `retry_instruction()`. Medical phrasing now names the allow-listed
+  brands (PubMed / WHO / CDC / Cochrane / NEJM) on `NO_SOURCE` so the
+  retry hint matches the domain's allow-list at the wording level, not
+  only at the validation level.
+
+### Removed
+
+- **`hallucination_guard.domain.base.Locale`** type alias. Locale is no
+  longer a framework concept; built-in domains define it privately
+  (`hallucination_guard.domain.general.Locale` and
+  `hallucination_guard.domain.medical.Locale`).
+- **`DomainConfig.retry_locale()`**. Domains express locale entirely
+  through `self.locale` and surface it via the per-domain
+  `retry_instruction` / `system_prompt` / `critic_prompt` /
+  `format_retry_directive` outputs.
+- **`RetryHintBuilder.INSTRUCTION_MAPS`** class attribute and the
+  `locale` keyword on `RetryHintBuilder.build`.
+
+### Migration notes
+
+- **Breaking for custom `DomainConfig` subclasses.** They must now
+  implement `retry_instruction(fail_reason) -> str`. There is no
+  framework-level default — that is the whole point of the change.
+  Existing `GeneralDomain` / `MedicalDomain` users see no behavior
+  change: the same English/Japanese phrasings ship as before.
+- **Imports.** Replace
+  `from hallucination_guard.domain.base import Locale` with
+  `from hallucination_guard.domain.general import Locale` (or the
+  medical equivalent) when typing your own `locale=` arguments.
+- **No `retry_locale()` shim.** If you previously overrode
+  `retry_locale()` in a custom domain, fold that logic into
+  `retry_instruction()` instead — it can read `self.locale` (or any
+  attribute) directly when picking a phrase.
+
 ## [0.9.0] — 2026-05-14
 
 ### Added

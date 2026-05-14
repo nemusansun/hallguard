@@ -1,35 +1,27 @@
 """DomainConfig — abstract Strategy interface for domain-specific behavior.
 
 Framework code MUST NOT contain domain-specific knowledge (thresholds, source
-validation rules, critic prompts, output schemas). Subclasses encapsulate that
-knowledge and are injected at graph construction time.
+validation rules, critic prompts, output schemas, retry-instruction wording).
+Subclasses encapsulate that knowledge and are injected at graph construction
+time.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Literal
 
 from pydantic import BaseModel
 
 from hallucination_guard.retry.directive import RetryDirective
-
-
-Locale = Literal["en", "ja"]
-"""Supported prompt locales for built-in domains.
-
-The framework itself stays locale-agnostic; ``Locale`` is exported so
-subclasses (and tests) can type-check ``locale`` arguments uniformly when
-they opt into multilingual prompts. Concrete domains are free to ignore it.
-"""
+from hallucination_guard.state import FailReason
 
 
 class DomainConfig(ABC):
     """Abstract domain configuration consumed by the graph nodes.
 
     Implementations supply the confidence threshold, source validation,
-    critic prompt, and structured output schema used by ``StructuredNode``,
-    ``FactCheckGate``, and ``CriticNode``.
+    critic prompt, output schema, and retry-instruction wording used by
+    ``StructuredNode``, ``FactCheckGate``, and ``CriticNode``.
     """
 
     @property
@@ -92,13 +84,18 @@ class DomainConfig(ABC):
         ``directive.forbidden_claims`` are safe to emit.
         """
 
-    def retry_locale(self) -> Locale:
-        """Return the locale used to render the retry ``fix_instruction``.
+    @abstractmethod
+    def retry_instruction(self, fail_reason: FailReason) -> str:
+        """Return the fix-instruction phrase for ``fail_reason``.
 
-        Defaults to ``"en"`` so subclasses that do not opt into multilingual
-        prompts get English retry hints — matching the default of
-        :meth:`RetryHintBuilder.build`. Domains that swap their other
-        prompts by locale should override this so the hint builder stays
-        aligned with the rest of the prompt surface.
+        Called by :class:`RetryHintBuilder` to populate
+        :attr:`RetryDirective.fix_instruction`. The framework core has no
+        opinion on wording or language — implementations own both. A domain
+        can vary the returned phrase by an internal ``self.locale``, by
+        audience (clinician vs. consumer), or by any other attribute it
+        tracks.
+
+        Implementations MUST return a fixed, hand-authored sentence; they
+        MUST NOT splice values from ``state.fail_history`` or any other
+        free-form text into the returned string.
         """
-        return "en"

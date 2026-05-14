@@ -85,7 +85,8 @@ def test_retry_attempt_injects_fix_instruction_for_no_source() -> None:
 
 
 def test_retry_attempt_uses_japanese_fix_instruction_when_domain_locale_is_ja() -> None:
-    """``StructuredNode`` forwards ``domain.retry_locale()`` to the hint builder."""
+    """``StructuredNode`` delegates wording entirely to the active domain, so
+    a Japanese-locale ``GeneralDomain`` surfaces a Japanese ``fix_instruction``."""
     llm = FakeStructuredLLM(payload=GroundedOutput())
     node = StructuredNode(GeneralDomain(locale="ja"), llm)
     node(

@@ -83,8 +83,6 @@ class StructuredNode:
     def _build_system(self, state: GraphState) -> str:
         base = self.domain.system_prompt()
         if state.retry_count > 0 and state.fail_reason is not None:
-            directive = RetryHintBuilder.build(
-                state, locale=self.domain.retry_locale()
-            )
+            directive = RetryHintBuilder.build(state, self.domain)
             return self.domain.format_retry_directive(base, directive)
         return base
