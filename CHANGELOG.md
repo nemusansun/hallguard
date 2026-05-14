@@ -6,7 +6,7 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.9.0] -- 2026-05-14
+## [0.9.0] — 2026-05-14
 
 ### Added
 
@@ -66,6 +66,8 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Custom code that inspects the raw dict returned by `_wrap` may see
   fewer keys (only changed fields are included now). This is an internal
   API; public callers should not be affected.
+
+## [0.8.2] — 2026-05-12
 
 ### Changed
 
