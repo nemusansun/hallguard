@@ -1112,3 +1112,132 @@ async def test_arun_concurrent_calls_do_not_share_fail_history() -> None:
 
     assert structured.peak_in_flight >= 2
     assert structured.peak_in_flight <= 32
+
+
+# --- source_fetcher wiring ---------------------------------------------------
+
+
+class _ScriptedFetcher:
+    """Returns a fixed verdict per URL; tracks call order for assertions."""
+
+    def __init__(self, verdicts: dict[str, bool]) -> None:
+        self._verdicts = verdicts
+        self.calls: list[str] = []
+
+    def check(self, url: str) -> bool:
+        self.calls.append(url)
+        return self._verdicts.get(url, False)
+
+
+def test_source_fetcher_pass_path_reaches_critic() -> None:
+    structured = ScriptedStructuredLLM([GroundedOutput(claims=[_good_claim()])])
+    judge = ScriptedJudgeLLM([CriticVerdict(verdict="PASS")])
+    fetcher = _ScriptedFetcher({"https://example.com/physics": True})
+
+    result = Graph(
+        domain=GeneralDomain(),
+        structured_llm=structured,
+        judge_llm=judge,
+        source_fetcher=fetcher,
+    ).run("query")
+
+    assert result.is_success is True
+    assert result.retry_count == 0
+    assert fetcher.calls == ["https://example.com/physics"]
+    assert len(judge.calls) == 1
+
+
+def test_source_fetcher_unreachable_triggers_retry_then_success() -> None:
+    structured = ScriptedStructuredLLM(
+        [
+            GroundedOutput(
+                claims=[
+                    Claim(
+                        text="dead-link claim",
+                        confidence=0.95,
+                        sources=["https://dead.example/1"],
+                    )
+                ]
+            ),
+            GroundedOutput(claims=[_good_claim()]),
+        ]
+    )
+    judge = ScriptedJudgeLLM([CriticVerdict(verdict="PASS")])
+    fetcher = _ScriptedFetcher(
+        {
+            "https://dead.example/1": False,
+            "https://example.com/physics": True,
+        }
+    )
+
+    result = Graph(
+        domain=GeneralDomain(),
+        structured_llm=structured,
+        judge_llm=judge,
+        source_fetcher=fetcher,
+    ).run("query")
+
+    assert result.is_success is True
+    assert result.retry_count == 1
+    assert any(
+        entry == "no_source:dead-link claim" for entry in result.fail_history
+    )
+
+
+def test_source_fetcher_exhausted_routes_to_error_output() -> None:
+    structured = ScriptedStructuredLLM(
+        [
+            GroundedOutput(
+                claims=[
+                    Claim(
+                        text="always dead",
+                        confidence=0.95,
+                        sources=["https://nope.example/1"],
+                    )
+                ]
+            )
+        ]
+    )
+    judge = ScriptedJudgeLLM([CriticVerdict(verdict="PASS")])
+    fetcher = _ScriptedFetcher({"https://nope.example/1": False})
+
+    result = Graph(
+        domain=GeneralDomain(),
+        structured_llm=structured,
+        judge_llm=judge,
+        source_fetcher=fetcher,
+        max_retries=2,
+    ).run("query")
+
+    assert result.is_success is False
+    assert result.retry_count == 2
+    assert result.error_message is not None
+    assert all(
+        entry.startswith(FailReason.NO_SOURCE.value + ":")
+        for entry in result.fail_history
+    )
+    assert judge.calls == []
+
+
+def test_source_fetcher_skipped_when_factcheck_fails() -> None:
+    """Confidence failure must short-circuit before the fetch node runs."""
+    structured = ScriptedStructuredLLM(
+        [
+            GroundedOutput(claims=[_low_confidence_claim()]),
+            GroundedOutput(claims=[_good_claim()]),
+        ]
+    )
+    judge = ScriptedJudgeLLM([CriticVerdict(verdict="PASS")])
+    fetcher = _ScriptedFetcher({"https://example.com/physics": True})
+
+    result = Graph(
+        domain=GeneralDomain(),
+        structured_llm=structured,
+        judge_llm=judge,
+        source_fetcher=fetcher,
+    ).run("query")
+
+    assert result.is_success is True
+    # The fetcher must only see the second attempt's source URL — the
+    # first attempt fails at FactCheckGate and never reaches the fetch node.
+    assert fetcher.calls == ["https://example.com/physics"]

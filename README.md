@@ -177,17 +177,24 @@ deactivate    # 抜けるとき
 .venv/bin/python -m pytest tests/ -v
 ```
 
-229 件 passing。内訳:
+253 件 passing。内訳:
 
 - **ノード単体** (`test_state.py` / `test_structured_node.py` /
   `test_factcheck_gate.py` / `test_critic_node.py` / `test_retry_node.py` /
   `test_error_output.py`、計 51 件)
-- **統合** (`test_graph_integration.py`、40 件) — `Graph` をモック LLM で
+- **`SourceFetchGate`** (`test_source_fetch_gate.py`、20 件) — モック
+  `SourceFetcher` で PASS / 全 unreachable / 空 sources / any-success /
+  `fail_history` 蓄積 / イミュータブル、`HTTPHeadFetcher` をローカル
+  `http.server` 立てて 200 / 302 / 404 / 500 / 405→GET fallback /
+  403→GET fallback / 不正 URL / 非 http スキーム / resolve 不能ホスト /
+  `accept_status` 設定変更を網羅
+- **統合** (`test_graph_integration.py`、44 件) — `Graph` をモック LLM で
   回し、成功経路 / リトライ / `max_retries` 超過 / `max_retries=0` /
   checkpointer 永続化 / `stream` / `astream` / `arun` / async-native /
   sync↔async フォールバック / `asyncio.wait_for` / 明示キャンセル /
   `asyncio.Semaphore(32)` 下の fan-out で state 分離と `fail_history`
-  非共有を検証
+  非共有 / `source_fetcher` opt-in 経路（PASS / unreachable→retry /
+  exhausted→ErrorOutput / FactCheckGate 失敗時の short-circuit）を検証
 - **並行モード** (`test_reducer.py` 8 件 / `test_parallel_graph.py` 13 件 /
   `test_parallel_checkpointer.py` 10 件、計 31 件) —
   `_ADDITIVE_FIELDS` 自動検出 / `_build_update_dict` の delta-only +
@@ -216,7 +223,7 @@ deactivate    # 抜けるとき
 .venv/bin/mypy hallucination_guard/
 ```
 
-`Success: no issues found in 25 source files` が出れば OK。
+`Success: no issues found in 26 source files` が出れば OK。
 
 ### デモ実行
 
@@ -364,6 +371,67 @@ graph = Graph(
 されます。空リスト `structured_llm=[]` は `ValueError` で即拒否されます。
 非同期クライアントを混ぜた場合の判定は単一モードと同じで、いずれかが
 async-only なら全体が async-native 経路に切り替わります。
+
+### 出典 URL の到達性を検証する（SourceFetchGate）
+
+`FactCheckGate.is_valid_source` は URL の **文字列形式**（scheme・host・
+ドメイン allow-list）だけを見ています。`https://pubmed.ncbi.nlm.nih.gov/`
+のホストを満たす完全に捏造された記事 ID も、文字列としては妥当なので
+そのまま通ってしまいます。
+
+`SourceFetchGate` を挟むと、各 claim の各 source URL に対して実際に
+HTTP リクエストを投げ、応答ステータスが受理レンジに入らない URL を
+unreachable として扱います。失敗時は `FactCheckGate` と同じ
+`FailReason.NO_SOURCE` で `RetryNode` に戻すため、ドメイン側の
+`retry_instruction(NO_SOURCE)` の文言がそのまま再試行ヒントになります。
+
+opt-in です。`source_fetcher` を渡さなければグラフは従来どおり
+ネットワーク I/O を一切行いません:
+
+```python
+from hallucination_guard.graph import Graph
+from hallucination_guard.nodes.source_fetch_gate import HTTPHeadFetcher
+
+graph = Graph(
+    domain=GeneralDomain(),
+    structured_llm=MyStructuredLLM(),
+    judge_llm=MyJudgeLLM(),
+    source_fetcher=HTTPHeadFetcher(timeout=5.0),
+)
+```
+
+`HTTPHeadFetcher` は標準ライブラリの `urllib.request` だけで動きます
+（新規依存なし）。HEAD で 403 / 405 が返ったときは GET にフォールバック
+します。`timeout` / `accept_status` / `user_agent` はコンストラクタで
+調整できます。
+
+`httpx` や `requests`、社内の HEAD キャッシュサービス、署名付き URL の
+有効期限チェックなど、独自の到達性判定を入れたい場合は
+`SourceFetcher` プロトコルを実装したクラスを渡せば差し替えられます:
+
+```python
+from hallucination_guard.nodes.source_fetch_gate import SourceFetcher
+
+class CachedHeadFetcher:
+    def __init__(self, client, cache):
+        self._client = client
+        self._cache = cache
+
+    def check(self, url: str) -> bool:
+        if (cached := self._cache.get(url)) is not None:
+            return cached
+        ok = 200 <= self._client.head(url, timeout=5.0).status_code < 400
+        self._cache.set(url, ok)
+        return ok
+
+# `isinstance(CachedHeadFetcher(...), SourceFetcher)` is True
+```
+
+ノードの順序は `FactCheckGate → SourceFetchGate → CriticNode`。
+`FactCheckGate` で confidence や string-shape source が落ちた場合は
+`SourceFetchGate` を通らないので、ネットワーク呼び出しは「文字列検査を
+通過した URL だけ」に対して発生します。再試行予算 (`max_retries`) は
+両ゲート共通で消費されます。
 
 ### State を永続化する（checkpointer）
 

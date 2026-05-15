@@ -6,6 +6,52 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-05-15
+
+### Added
+
+- **`SourceFetchGate`** — an opt-in node that issues a real HTTP request
+  per claim source URL and routes unreachable sources back through
+  `RetryNode`. Bridges the gap that `FactCheckGate.is_valid_source` left
+  open: a URL whose host passes a string-shape allow-list but points at
+  a fabricated path used to slip through; now it fails the gate.
+- **`SourceFetcher` protocol** — the pluggable strategy interface the
+  gate calls. Implement `check(url) -> bool` with any transport
+  (`urllib`, `httpx`, a cached HEAD service, signed-URL validator, …).
+- **`HTTPHeadFetcher`** — stdlib-only default that issues a HEAD request
+  and falls back to GET on 403/405. Configurable `timeout`,
+  `accept_status`, `user_agent`. No new third-party dependency.
+
+### Changed
+
+- `Graph.__init__` accepts a new `source_fetcher=` keyword. When set,
+  the gate is inserted between `FactCheckGate` and `CriticNode`; the
+  retry budget covers reachability failures as well as string-shape
+  ones. Omitting it preserves the previous network-free graph topology
+  exactly, so existing callers are unaffected.
+
+### Migration notes
+
+This release is backwards-compatible. Custom `DomainConfig` subclasses
+need no changes. To opt in:
+
+```python
+from hallucination_guard.graph import Graph
+from hallucination_guard.nodes.source_fetch_gate import HTTPHeadFetcher
+
+graph = Graph(
+    domain=...,
+    structured_llm=...,
+    judge_llm=...,
+    source_fetcher=HTTPHeadFetcher(timeout=5.0),
+)
+```
+
+Failures from the new node are reported as `FailReason.NO_SOURCE`, the
+same category `FactCheckGate` uses for empty / invalid sources, so the
+domain's existing `retry_instruction(FailReason.NO_SOURCE)` wording
+already covers the retry hint.
+
 ## [0.10.0] — 2026-05-14
 
 ### Changed

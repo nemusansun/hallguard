@@ -51,6 +51,10 @@ from hallucination_guard.nodes.critic_node import CriticNode
 from hallucination_guard.nodes.error_output import ErrorOutput
 from hallucination_guard.nodes.factcheck_gate import FactCheckGate
 from hallucination_guard.nodes.retry_node import RetryNode
+from hallucination_guard.nodes.source_fetch_gate import (
+    SourceFetcher,
+    SourceFetchGate,
+)
 from hallucination_guard.nodes.structured_node import StructuredNode
 from hallucination_guard.serde import install_framework_serializer
 from hallucination_guard.state import GraphState
@@ -58,6 +62,7 @@ from hallucination_guard.state import GraphState
 
 _STRUCTURED = "structured"
 _FACTCHECK = "factcheck"
+_SOURCE_FETCH = "source_fetch"
 _CRITIC = "critic"
 _RETRY = "retry"
 _ERROR = "error"
@@ -107,6 +112,33 @@ def _route_after_gate(state: GraphState) -> str:
     The ``retry_count >= max_retries`` guard is evaluated **before** the
     FAIL branch so an exhausted budget always terminates via ErrorOutput
     instead of looping back through RetryNode.
+    """
+    if state.gate_result == "FAIL":
+        if state.retry_count >= state.max_retries:
+            return _ERROR
+        return _RETRY
+    return _CRITIC
+
+
+def _route_after_gate_with_fetch(state: GraphState) -> str:
+    """FactCheckGate routing when a ``SourceFetchGate`` is wired in.
+
+    PASS continues to the source-fetch node; FAIL follows the same retry /
+    error rules as :func:`_route_after_gate`.
+    """
+    if state.gate_result == "FAIL":
+        if state.retry_count >= state.max_retries:
+            return _ERROR
+        return _RETRY
+    return _SOURCE_FETCH
+
+
+def _route_after_source_fetch(state: GraphState) -> str:
+    """Decide the next node after SourceFetchGate.
+
+    PASS proceeds to CriticNode; FAIL takes the same retry / error path
+    as :func:`_route_after_gate` so the retry budget covers reachability
+    failures as well as string-shape failures.
     """
     if state.gate_result == "FAIL":
         if state.retry_count >= state.max_retries:
@@ -284,6 +316,13 @@ class Graph:
     ``serde=build_serializer()`` yourself. The swap is rejected when the
     checkpointer already carries a customized serializer so user-supplied
     allowlists are never silently clobbered.
+
+    Pass ``source_fetcher`` (any :class:`SourceFetcher`) to insert a
+    :class:`SourceFetchGate` between ``FactCheckGate`` and ``CriticNode``.
+    The extra node performs a real HTTP request per claim source URL and
+    routes unreachable ones back through ``RetryNode`` as a
+    ``NO_SOURCE`` failure. The graph performs no network I/O when this
+    argument is omitted.
     """
 
     def __init__(
@@ -299,6 +338,7 @@ class Graph:
         checkpointer: Any = None,
         auto_serialize: bool = False,
         merge_strategy: Callable[[list[Any]], Any] | None = None,
+        source_fetcher: SourceFetcher | None = None,
     ) -> None:
         if max_retries < 0:
             raise ValueError("max_retries must be non-negative")
@@ -311,6 +351,7 @@ class Graph:
         self.domain = domain
         self.max_retries = max_retries
         self._checkpointer = checkpointer
+        self._source_fetcher = source_fetcher
 
         # Normalise structured_llm to a list for uniform handling.
         if isinstance(structured_llm, list):
@@ -331,11 +372,16 @@ class Graph:
         judge_is_async = _is_async_client(judge_llm, AsyncJudgeLLM, JudgeLLM)
         self._async_mode = any_struct_async or judge_is_async
 
+        source_fetch_node = (
+            SourceFetchGate(source_fetcher) if source_fetcher is not None else None
+        )
+
         common = dict(
             factcheck=FactCheckGate(domain),
             critic=CriticNode(domain, judge_llm),
             retry=RetryNode(),
             error=ErrorOutput(),
+            source_fetch=source_fetch_node,
             checkpointer=checkpointer,
             async_mode=self._async_mode,
         )
@@ -545,6 +591,7 @@ class Graph:
         critic: Any,
         retry: Any,
         error: Any,
+        source_fetch: Any = None,
         checkpointer: Any = None,
         async_mode: bool = False,
     ) -> Any:
@@ -555,14 +602,32 @@ class Graph:
         graph.add_node(_CRITIC, wrap(critic))
         graph.add_node(_RETRY, wrap(retry))
         graph.add_node(_ERROR, wrap(error))
+        if source_fetch is not None:
+            graph.add_node(_SOURCE_FETCH, wrap(source_fetch))
 
         graph.add_edge(START, _STRUCTURED)
         graph.add_edge(_STRUCTURED, _FACTCHECK)
-        graph.add_conditional_edges(
-            _FACTCHECK,
-            _route_after_gate,
-            {_RETRY: _RETRY, _CRITIC: _CRITIC, _ERROR: _ERROR},
-        )
+        if source_fetch is not None:
+            graph.add_conditional_edges(
+                _FACTCHECK,
+                _route_after_gate_with_fetch,
+                {
+                    _RETRY: _RETRY,
+                    _SOURCE_FETCH: _SOURCE_FETCH,
+                    _ERROR: _ERROR,
+                },
+            )
+            graph.add_conditional_edges(
+                _SOURCE_FETCH,
+                _route_after_source_fetch,
+                {_RETRY: _RETRY, _CRITIC: _CRITIC, _ERROR: _ERROR},
+            )
+        else:
+            graph.add_conditional_edges(
+                _FACTCHECK,
+                _route_after_gate,
+                {_RETRY: _RETRY, _CRITIC: _CRITIC, _ERROR: _ERROR},
+            )
         graph.add_conditional_edges(
             _CRITIC,
             _route_after_critic,
@@ -584,6 +649,7 @@ class Graph:
         critic: Any,
         retry: Any,
         error: Any,
+        source_fetch: Any = None,
         checkpointer: Any = None,
         async_mode: bool = False,
     ) -> Any:
@@ -613,16 +679,34 @@ class Graph:
         graph.add_node(_CRITIC, wrap(critic))
         graph.add_node(_RETRY, wrap(retry))
         graph.add_node(_ERROR, wrap(error))
+        if source_fetch is not None:
+            graph.add_node(_SOURCE_FETCH, wrap(source_fetch))
 
         graph.add_edge(START, _DISPATCH)
         graph.add_conditional_edges(_DISPATCH, _fan_out, [_STRUCTURED])
         graph.add_edge(_STRUCTURED, _AGGREGATE)
         graph.add_edge(_AGGREGATE, _FACTCHECK)
-        graph.add_conditional_edges(
-            _FACTCHECK,
-            _route_after_gate,
-            {_RETRY: _RETRY, _CRITIC: _CRITIC, _ERROR: _ERROR},
-        )
+        if source_fetch is not None:
+            graph.add_conditional_edges(
+                _FACTCHECK,
+                _route_after_gate_with_fetch,
+                {
+                    _RETRY: _RETRY,
+                    _SOURCE_FETCH: _SOURCE_FETCH,
+                    _ERROR: _ERROR,
+                },
+            )
+            graph.add_conditional_edges(
+                _SOURCE_FETCH,
+                _route_after_source_fetch,
+                {_RETRY: _RETRY, _CRITIC: _CRITIC, _ERROR: _ERROR},
+            )
+        else:
+            graph.add_conditional_edges(
+                _FACTCHECK,
+                _route_after_gate,
+                {_RETRY: _RETRY, _CRITIC: _CRITIC, _ERROR: _ERROR},
+            )
         graph.add_conditional_edges(
             _CRITIC,
             _route_after_critic,
