@@ -51,6 +51,11 @@ from hallucination_guard.nodes.critic_node import CriticNode
 from hallucination_guard.nodes.error_output import ErrorOutput
 from hallucination_guard.nodes.factcheck_gate import FactCheckGate
 from hallucination_guard.nodes.retry_node import RetryNode
+from hallucination_guard.nodes.source_content_gate import (
+    ContentFetcher,
+    SourceContentGate,
+    SupportJudge,
+)
 from hallucination_guard.nodes.source_fetch_gate import (
     SourceFetcher,
     SourceFetchGate,
@@ -63,6 +68,7 @@ from hallucination_guard.state import GraphState
 _STRUCTURED = "structured"
 _FACTCHECK = "factcheck"
 _SOURCE_FETCH = "source_fetch"
+_SOURCE_CONTENT = "source_content"
 _CRITIC = "critic"
 _RETRY = "retry"
 _ERROR = "error"
@@ -106,45 +112,26 @@ class StreamEvent:
     state: GraphState
 
 
-def _route_after_gate(state: GraphState) -> str:
-    """Decide the next node after FactCheckGate.
+def _make_gate_router(next_on_pass: str) -> Callable[[GraphState], str]:
+    """Build a gate-routing function whose PASS edge points at ``next_on_pass``.
 
-    The ``retry_count >= max_retries`` guard is evaluated **before** the
-    FAIL branch so an exhausted budget always terminates via ErrorOutput
-    instead of looping back through RetryNode.
+    Used for every pre-critic gate (FactCheckGate, SourceFetchGate,
+    SourceContentGate). FAIL always routes to ``_RETRY`` unless the
+    retry budget is exhausted, in which case it routes to ``_ERROR``;
+    PASS forwards to the next configured gate (or ``_CRITIC`` when no
+    further gates are wired). The ``retry_count >= max_retries`` guard
+    is evaluated **before** the FAIL branch so an exhausted budget
+    always terminates via ErrorOutput instead of looping.
     """
-    if state.gate_result == "FAIL":
-        if state.retry_count >= state.max_retries:
-            return _ERROR
-        return _RETRY
-    return _CRITIC
 
+    def router(state: GraphState) -> str:
+        if state.gate_result == "FAIL":
+            if state.retry_count >= state.max_retries:
+                return _ERROR
+            return _RETRY
+        return next_on_pass
 
-def _route_after_gate_with_fetch(state: GraphState) -> str:
-    """FactCheckGate routing when a ``SourceFetchGate`` is wired in.
-
-    PASS continues to the source-fetch node; FAIL follows the same retry /
-    error rules as :func:`_route_after_gate`.
-    """
-    if state.gate_result == "FAIL":
-        if state.retry_count >= state.max_retries:
-            return _ERROR
-        return _RETRY
-    return _SOURCE_FETCH
-
-
-def _route_after_source_fetch(state: GraphState) -> str:
-    """Decide the next node after SourceFetchGate.
-
-    PASS proceeds to CriticNode; FAIL takes the same retry / error path
-    as :func:`_route_after_gate` so the retry budget covers reachability
-    failures as well as string-shape failures.
-    """
-    if state.gate_result == "FAIL":
-        if state.retry_count >= state.max_retries:
-            return _ERROR
-        return _RETRY
-    return _CRITIC
+    return router
 
 
 def _route_after_critic(state: GraphState) -> str:
@@ -323,6 +310,15 @@ class Graph:
     routes unreachable ones back through ``RetryNode`` as a
     ``NO_SOURCE`` failure. The graph performs no network I/O when this
     argument is omitted.
+
+    Pass both ``content_fetcher`` (any :class:`ContentFetcher`) and
+    ``support_judge`` (any :class:`SupportJudge`) to insert a
+    :class:`SourceContentGate` after the reachability check. The extra
+    node fetches each source URL's body and asks the judge whether the
+    body supports the claim, routing unsupported ones back through
+    ``RetryNode`` as a ``NO_SOURCE`` failure. Both arguments must be
+    supplied together — passing only one raises ``ValueError`` — because
+    content judgement requires both a transport and a verdict source.
     """
 
     def __init__(
@@ -339,9 +335,15 @@ class Graph:
         auto_serialize: bool = False,
         merge_strategy: Callable[[list[Any]], Any] | None = None,
         source_fetcher: SourceFetcher | None = None,
+        content_fetcher: ContentFetcher | None = None,
+        support_judge: SupportJudge | None = None,
     ) -> None:
         if max_retries < 0:
             raise ValueError("max_retries must be non-negative")
+        if (content_fetcher is None) != (support_judge is None):
+            raise ValueError(
+                "content_fetcher and support_judge must be supplied together"
+            )
         if auto_serialize:
             if checkpointer is None:
                 raise ValueError(
@@ -352,6 +354,8 @@ class Graph:
         self.max_retries = max_retries
         self._checkpointer = checkpointer
         self._source_fetcher = source_fetcher
+        self._content_fetcher = content_fetcher
+        self._support_judge = support_judge
 
         # Normalise structured_llm to a list for uniform handling.
         if isinstance(structured_llm, list):
@@ -375,6 +379,11 @@ class Graph:
         source_fetch_node = (
             SourceFetchGate(source_fetcher) if source_fetcher is not None else None
         )
+        source_content_node = (
+            SourceContentGate(content_fetcher, support_judge)
+            if content_fetcher is not None and support_judge is not None
+            else None
+        )
 
         common = dict(
             factcheck=FactCheckGate(domain),
@@ -382,6 +391,7 @@ class Graph:
             retry=RetryNode(),
             error=ErrorOutput(),
             source_fetch=source_fetch_node,
+            source_content=source_content_node,
             checkpointer=checkpointer,
             async_mode=self._async_mode,
         )
@@ -584,6 +594,48 @@ class Graph:
         return None
 
     @staticmethod
+    def _gate_chain(
+        factcheck: Any,
+        source_fetch: Any,
+        source_content: Any,
+    ) -> list[tuple[str, Any]]:
+        """Return the ordered list of pre-critic gates that are wired in.
+
+        FactCheckGate is always present; SourceFetchGate and
+        SourceContentGate are inserted in that order when supplied.
+        Each entry is ``(node_name, callable)`` for direct registration
+        with the underlying ``StateGraph``.
+        """
+        gates: list[tuple[str, Any]] = [(_FACTCHECK, factcheck)]
+        if source_fetch is not None:
+            gates.append((_SOURCE_FETCH, source_fetch))
+        if source_content is not None:
+            gates.append((_SOURCE_CONTENT, source_content))
+        return gates
+
+    @staticmethod
+    def _wire_gate_chain(
+        graph: Any, gates: list[tuple[str, Any]], wrap: Callable[..., Any]
+    ) -> None:
+        """Register the pre-critic gate chain on ``graph``.
+
+        Each gate's PASS edge forwards to the next gate; the final
+        gate's PASS edge forwards to ``_CRITIC``. FAIL routing on every
+        gate is identical (retry or error, budget-checked) so the same
+        factory-built router is reused.
+        """
+        for name, node in gates:
+            graph.add_node(name, wrap(node))
+
+        for i, (name, _node) in enumerate(gates):
+            next_on_pass = gates[i + 1][0] if i + 1 < len(gates) else _CRITIC
+            graph.add_conditional_edges(
+                name,
+                _make_gate_router(next_on_pass),
+                {_RETRY: _RETRY, next_on_pass: next_on_pass, _ERROR: _ERROR},
+            )
+
+    @staticmethod
     def _build(
         *,
         structured: Any,
@@ -592,42 +644,22 @@ class Graph:
         retry: Any,
         error: Any,
         source_fetch: Any = None,
+        source_content: Any = None,
         checkpointer: Any = None,
         async_mode: bool = False,
     ) -> Any:
         wrap = _wrap_async if async_mode else _wrap
         graph: Any = StateGraph(GraphState)
         graph.add_node(_STRUCTURED, wrap(structured))
-        graph.add_node(_FACTCHECK, wrap(factcheck))
         graph.add_node(_CRITIC, wrap(critic))
         graph.add_node(_RETRY, wrap(retry))
         graph.add_node(_ERROR, wrap(error))
-        if source_fetch is not None:
-            graph.add_node(_SOURCE_FETCH, wrap(source_fetch))
+
+        gates = Graph._gate_chain(factcheck, source_fetch, source_content)
+        Graph._wire_gate_chain(graph, gates, wrap)
 
         graph.add_edge(START, _STRUCTURED)
-        graph.add_edge(_STRUCTURED, _FACTCHECK)
-        if source_fetch is not None:
-            graph.add_conditional_edges(
-                _FACTCHECK,
-                _route_after_gate_with_fetch,
-                {
-                    _RETRY: _RETRY,
-                    _SOURCE_FETCH: _SOURCE_FETCH,
-                    _ERROR: _ERROR,
-                },
-            )
-            graph.add_conditional_edges(
-                _SOURCE_FETCH,
-                _route_after_source_fetch,
-                {_RETRY: _RETRY, _CRITIC: _CRITIC, _ERROR: _ERROR},
-            )
-        else:
-            graph.add_conditional_edges(
-                _FACTCHECK,
-                _route_after_gate,
-                {_RETRY: _RETRY, _CRITIC: _CRITIC, _ERROR: _ERROR},
-            )
+        graph.add_edge(_STRUCTURED, gates[0][0])
         graph.add_conditional_edges(
             _CRITIC,
             _route_after_critic,
@@ -650,6 +682,7 @@ class Graph:
         retry: Any,
         error: Any,
         source_fetch: Any = None,
+        source_content: Any = None,
         checkpointer: Any = None,
         async_mode: bool = False,
     ) -> Any:
@@ -675,38 +708,17 @@ class Graph:
         graph.add_node(_DISPATCH, wrap(_pass_through))
         graph.add_node(_STRUCTURED, wrap_par(parallel_node))
         graph.add_node(_AGGREGATE, wrap(aggregator))
-        graph.add_node(_FACTCHECK, wrap(factcheck))
         graph.add_node(_CRITIC, wrap(critic))
         graph.add_node(_RETRY, wrap(retry))
         graph.add_node(_ERROR, wrap(error))
-        if source_fetch is not None:
-            graph.add_node(_SOURCE_FETCH, wrap(source_fetch))
+
+        gates = Graph._gate_chain(factcheck, source_fetch, source_content)
+        Graph._wire_gate_chain(graph, gates, wrap)
 
         graph.add_edge(START, _DISPATCH)
         graph.add_conditional_edges(_DISPATCH, _fan_out, [_STRUCTURED])
         graph.add_edge(_STRUCTURED, _AGGREGATE)
-        graph.add_edge(_AGGREGATE, _FACTCHECK)
-        if source_fetch is not None:
-            graph.add_conditional_edges(
-                _FACTCHECK,
-                _route_after_gate_with_fetch,
-                {
-                    _RETRY: _RETRY,
-                    _SOURCE_FETCH: _SOURCE_FETCH,
-                    _ERROR: _ERROR,
-                },
-            )
-            graph.add_conditional_edges(
-                _SOURCE_FETCH,
-                _route_after_source_fetch,
-                {_RETRY: _RETRY, _CRITIC: _CRITIC, _ERROR: _ERROR},
-            )
-        else:
-            graph.add_conditional_edges(
-                _FACTCHECK,
-                _route_after_gate,
-                {_RETRY: _RETRY, _CRITIC: _CRITIC, _ERROR: _ERROR},
-            )
+        graph.add_edge(_AGGREGATE, gates[0][0])
         graph.add_conditional_edges(
             _CRITIC,
             _route_after_critic,

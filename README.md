@@ -177,7 +177,7 @@ deactivate    # 抜けるとき
 .venv/bin/python -m pytest tests/ -v
 ```
 
-253 件 passing。内訳:
+280 件 passing。内訳:
 
 - **ノード単体** (`test_state.py` / `test_structured_node.py` /
   `test_factcheck_gate.py` / `test_critic_node.py` / `test_retry_node.py` /
@@ -188,13 +188,24 @@ deactivate    # 抜けるとき
   `http.server` 立てて 200 / 302 / 404 / 500 / 405→GET fallback /
   403→GET fallback / 不正 URL / 非 http スキーム / resolve 不能ホスト /
   `accept_status` 設定変更を網羅
-- **統合** (`test_graph_integration.py`、44 件) — `Graph` をモック LLM で
+- **`SourceContentGate`** (`test_source_content_gate.py`、20 件) —
+  `_RecordingFetcher` / `_RecordingJudge` で PASS / unsupported / 空
+  sources / fetch が None で judge skip / blank passage skip / claim
+  ごとの short-circuit / 後段 source で PASS / `fail_history` 蓄積 /
+  既存履歴保持 / `GraphError` / イミュータブル。`HTTPContentFetcher` は
+  `http.server` で HTML→text 抽出（script/style/head 除外）、404、空 body
+  → None、`max_chars` 切り詰め、空 URL / 非 http スキーム / 解決不能
+  ホスト rejection、コンストラクタ validate を網羅
+- **統合** (`test_graph_integration.py`、51 件) — `Graph` をモック LLM で
   回し、成功経路 / リトライ / `max_retries` 超過 / `max_retries=0` /
   checkpointer 永続化 / `stream` / `astream` / `arun` / async-native /
   sync↔async フォールバック / `asyncio.wait_for` / 明示キャンセル /
   `asyncio.Semaphore(32)` 下の fan-out で state 分離と `fail_history`
   非共有 / `source_fetcher` opt-in 経路（PASS / unreachable→retry /
-  exhausted→ErrorOutput / FactCheckGate 失敗時の short-circuit）を検証
+  exhausted→ErrorOutput / FactCheckGate 失敗時の short-circuit）/
+  `content_fetcher` + `support_judge` 経路（PASS / unsupported→retry /
+  exhausted→ErrorOutput / source_fetcher と併用時の順序 / 片方だけ
+  指定で ValueError）を検証
 - **並行モード** (`test_reducer.py` 8 件 / `test_parallel_graph.py` 13 件 /
   `test_parallel_checkpointer.py` 10 件、計 31 件) —
   `_ADDITIVE_FIELDS` 自動検出 / `_build_update_dict` の delta-only +
@@ -223,7 +234,7 @@ deactivate    # 抜けるとき
 .venv/bin/mypy hallucination_guard/
 ```
 
-`Success: no issues found in 26 source files` が出れば OK。
+`Success: no issues found in 27 source files` が出れば OK。
 
 ### デモ実行
 
@@ -432,6 +443,71 @@ class CachedHeadFetcher:
 `SourceFetchGate` を通らないので、ネットワーク呼び出しは「文字列検査を
 通過した URL だけ」に対して発生します。再試行予算 (`max_retries`) は
 両ゲート共通で消費されます。
+
+### 出典本文と claim を突き合わせる（SourceContentGate）
+
+`SourceFetchGate` は URL が「生きているか」までしか見ません。生きている
+URL の本文が claim と無関係でも、HTTP 200 さえ返れば PASS してしまいます。
+`SourceContentGate` を opt-in で挟むと、各 source URL の **本文を実際に
+取得して**、別 judge に「この本文は claim を裏付けているか?」を判定
+させます。判定が失敗した claim は `RetryNode` に戻り、`FactCheckGate` /
+`SourceFetchGate` と同じ `FailReason.NO_SOURCE` を消費します。
+
+注入する戦略は 2 つです:
+
+- `ContentFetcher.fetch(url) -> str | None` — 取得して本文文字列を返す。
+  到達不能 / paywall / 抽出失敗時は `None`
+- `SupportJudge.supports(claim, passage) -> bool` — 本文が claim を
+  裏付けるかを判定。通常は `judge_llm` とは別の（より安価な）LLM に
+  「裏付けあり/なし」を問う
+
+```python
+from hallucination_guard.graph import Graph
+from hallucination_guard.nodes.source_content_gate import (
+    HTTPContentFetcher,
+    SupportJudge,
+)
+
+class LLMSupportJudge:
+    def __init__(self, client, model: str) -> None:
+        self._client = client
+        self._model = model
+
+    def supports(self, claim: str, passage: str) -> bool:
+        # 任意のモデルに「この passage は claim を裏付けるか?」を投げ、
+        # bool に落とす。SourceContentGate がこのメソッドだけを呼ぶ。
+        ...
+
+graph = Graph(
+    domain=GeneralDomain(),
+    structured_llm=MyStructuredLLM(),
+    judge_llm=MyJudgeLLM(),
+    source_fetcher=...,                              # 任意
+    content_fetcher=HTTPContentFetcher(timeout=10.0),
+    support_judge=LLMSupportJudge(my_client, "<your-model-id>"),
+)
+```
+
+`content_fetcher` と `support_judge` は **両方セット** が必須です。
+片方だけ渡すと `ValueError` で即拒否します（fetch だけ・judge だけは
+意味を成さない）。
+
+`HTTPContentFetcher` は stdlib 縛りの簡易抽出器です。`urllib.request` で
+GET し、`html.parser` で `<script>` / `<style>` / `<head>` を除外して
+可視テキストだけを返します。`max_bytes` / `max_chars` で本文長を上限
+する設計なので、judge へ渡すプロンプトサイズが暴走しません。本格的な
+抽出が必要なら `trafilatura` / `readability-lxml` などを使った独自
+`ContentFetcher` 実装に差し替えてください。
+
+判定は **claim ごとに short-circuit** されます: ある source URL の
+本文が judge に support 判定されれば、その claim の残りの source は
+fetch も judge も呼ばれません。最悪計算量は claim 数 × source 数 ですが、
+通常は最初の引用が通れば 1 ペアで済みます。
+
+ノードの順序は `FactCheckGate → SourceFetchGate → SourceContentGate
+→ CriticNode`。`source_fetcher` / `content_fetcher` をどちらか・両方
+渡せる任意の組み合わせを、内部の dynamic gate chain が共通の routing
+factory で配線します。
 
 ### State を永続化する（checkpointer）
 

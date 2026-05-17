@@ -1241,3 +1241,225 @@ def test_source_fetcher_skipped_when_factcheck_fails() -> None:
     # The fetcher must only see the second attempt's source URL — the
     # first attempt fails at FactCheckGate and never reaches the fetch node.
     assert fetcher.calls == ["https://example.com/physics"]
+
+
+# --- content_fetcher / support_judge wiring ----------------------------------
+
+
+class _ScriptedContentFetcher:
+    def __init__(self, passages: dict[str, str | None]) -> None:
+        self._passages = passages
+        self.calls: list[str] = []
+
+    def fetch(self, url: str) -> str | None:
+        self.calls.append(url)
+        return self._passages.get(url)
+
+
+class _ScriptedSupportJudge:
+    def __init__(self, verdicts: dict[tuple[str, str], bool]) -> None:
+        self._verdicts = verdicts
+        self.calls: list[tuple[str, str]] = []
+
+    def supports(self, claim: str, passage: str) -> bool:
+        self.calls.append((claim, passage))
+        return self._verdicts.get((claim, passage), False)
+
+
+def test_content_gate_pass_path_reaches_critic() -> None:
+    structured = ScriptedStructuredLLM([GroundedOutput(claims=[_good_claim()])])
+    judge_llm = ScriptedJudgeLLM([CriticVerdict(verdict="PASS")])
+    content_fetcher = _ScriptedContentFetcher(
+        {"https://example.com/physics": "water boils at 100C at sea level"}
+    )
+    support_judge = _ScriptedSupportJudge(
+        {("Water boils at 100C at sea level", "water boils at 100C at sea level"): True}
+    )
+
+    result = Graph(
+        domain=GeneralDomain(),
+        structured_llm=structured,
+        judge_llm=judge_llm,
+        content_fetcher=content_fetcher,
+        support_judge=support_judge,
+    ).run("query")
+
+    assert result.is_success is True
+    assert result.retry_count == 0
+    assert content_fetcher.calls == ["https://example.com/physics"]
+    assert support_judge.calls == [
+        ("Water boils at 100C at sea level", "water boils at 100C at sea level")
+    ]
+
+
+def test_content_gate_unsupported_triggers_retry_then_success() -> None:
+    structured = ScriptedStructuredLLM(
+        [
+            GroundedOutput(
+                claims=[
+                    Claim(
+                        text="A",
+                        confidence=0.95,
+                        sources=["https://lies.example/1"],
+                    )
+                ]
+            ),
+            GroundedOutput(claims=[_good_claim()]),
+        ]
+    )
+    judge_llm = ScriptedJudgeLLM([CriticVerdict(verdict="PASS")])
+    content_fetcher = _ScriptedContentFetcher(
+        {
+            "https://lies.example/1": "completely unrelated text",
+            "https://example.com/physics": "water boils at 100C at sea level",
+        }
+    )
+    support_judge = _ScriptedSupportJudge(
+        {("Water boils at 100C at sea level", "water boils at 100C at sea level"): True}
+    )
+
+    result = Graph(
+        domain=GeneralDomain(),
+        structured_llm=structured,
+        judge_llm=judge_llm,
+        content_fetcher=content_fetcher,
+        support_judge=support_judge,
+    ).run("query")
+
+    assert result.is_success is True
+    assert result.retry_count == 1
+    assert any(entry == "no_source:A" for entry in result.fail_history)
+
+
+def test_content_gate_exhausted_routes_to_error_output() -> None:
+    structured = ScriptedStructuredLLM(
+        [
+            GroundedOutput(
+                claims=[
+                    Claim(
+                        text="A",
+                        confidence=0.95,
+                        sources=["https://lies.example/1"],
+                    )
+                ]
+            )
+        ]
+    )
+    judge_llm = ScriptedJudgeLLM([CriticVerdict(verdict="PASS")])
+    content_fetcher = _ScriptedContentFetcher(
+        {"https://lies.example/1": "unrelated text"}
+    )
+    support_judge = _ScriptedSupportJudge({})  # everything False
+
+    result = Graph(
+        domain=GeneralDomain(),
+        structured_llm=structured,
+        judge_llm=judge_llm,
+        content_fetcher=content_fetcher,
+        support_judge=support_judge,
+        max_retries=2,
+    ).run("query")
+
+    assert result.is_success is False
+    assert result.retry_count == 2
+    assert result.error_message is not None
+    assert all(
+        entry.startswith(FailReason.NO_SOURCE.value + ":")
+        for entry in result.fail_history
+    )
+    assert judge_llm.calls == []  # never reaches CriticNode
+
+
+def test_content_gate_and_source_fetcher_run_in_order() -> None:
+    """Reachability check is performed before the content fetch."""
+    structured = ScriptedStructuredLLM([GroundedOutput(claims=[_good_claim()])])
+    judge_llm = ScriptedJudgeLLM([CriticVerdict(verdict="PASS")])
+    source_fetcher = _ScriptedFetcher({"https://example.com/physics": True})
+    content_fetcher = _ScriptedContentFetcher(
+        {"https://example.com/physics": "supporting body"}
+    )
+    support_judge = _ScriptedSupportJudge(
+        {("Water boils at 100C at sea level", "supporting body"): True}
+    )
+
+    result = Graph(
+        domain=GeneralDomain(),
+        structured_llm=structured,
+        judge_llm=judge_llm,
+        source_fetcher=source_fetcher,
+        content_fetcher=content_fetcher,
+        support_judge=support_judge,
+    ).run("query")
+
+    assert result.is_success is True
+    assert source_fetcher.calls == ["https://example.com/physics"]
+    assert content_fetcher.calls == ["https://example.com/physics"]
+
+
+def test_content_gate_skipped_when_source_fetcher_fails() -> None:
+    """Unreachable URL must short-circuit before the content fetcher runs."""
+    structured = ScriptedStructuredLLM(
+        [
+            GroundedOutput(
+                claims=[
+                    Claim(
+                        text="dead",
+                        confidence=0.95,
+                        sources=["https://dead.example/1"],
+                    )
+                ]
+            ),
+            GroundedOutput(claims=[_good_claim()]),
+        ]
+    )
+    judge_llm = ScriptedJudgeLLM([CriticVerdict(verdict="PASS")])
+    source_fetcher = _ScriptedFetcher(
+        {
+            "https://dead.example/1": False,
+            "https://example.com/physics": True,
+        }
+    )
+    content_fetcher = _ScriptedContentFetcher(
+        {"https://example.com/physics": "supporting body"}
+    )
+    support_judge = _ScriptedSupportJudge(
+        {("Water boils at 100C at sea level", "supporting body"): True}
+    )
+
+    result = Graph(
+        domain=GeneralDomain(),
+        structured_llm=structured,
+        judge_llm=judge_llm,
+        source_fetcher=source_fetcher,
+        content_fetcher=content_fetcher,
+        support_judge=support_judge,
+    ).run("query")
+
+    assert result.is_success is True
+    # The content fetcher must never see the dead URL.
+    assert "https://dead.example/1" not in content_fetcher.calls
+    assert content_fetcher.calls == ["https://example.com/physics"]
+
+
+def test_graph_rejects_content_fetcher_without_support_judge() -> None:
+    structured = ScriptedStructuredLLM([GroundedOutput(claims=[_good_claim()])])
+    judge_llm = ScriptedJudgeLLM([CriticVerdict(verdict="PASS")])
+    with pytest.raises(ValueError):
+        Graph(
+            domain=GeneralDomain(),
+            structured_llm=structured,
+            judge_llm=judge_llm,
+            content_fetcher=_ScriptedContentFetcher({}),
+        )
+
+
+def test_graph_rejects_support_judge_without_content_fetcher() -> None:
+    structured = ScriptedStructuredLLM([GroundedOutput(claims=[_good_claim()])])
+    judge_llm = ScriptedJudgeLLM([CriticVerdict(verdict="PASS")])
+    with pytest.raises(ValueError):
+        Graph(
+            domain=GeneralDomain(),
+            structured_llm=structured,
+            judge_llm=judge_llm,
+            support_judge=_ScriptedSupportJudge({}),
+        )

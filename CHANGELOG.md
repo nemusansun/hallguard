@@ -6,6 +6,73 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-05-15
+
+### Added
+
+- **`SourceContentGate`** — an opt-in node that fetches each claim's
+  source URL body and asks a judge whether the body actually supports
+  the claim. Closes the remaining gap that `SourceFetchGate` left open:
+  an alive URL whose content has nothing to do with the claim used to
+  pass; now it fails the gate. Per-claim short-circuit — once one
+  source passes, remaining sources for that claim are skipped.
+- **`ContentFetcher` protocol** — pluggable strategy that returns page
+  text (or `None` for unreachable / unparseable / paywalled URLs).
+- **`SupportJudge` protocol** — pluggable strategy that decides whether
+  a passage supports a claim. Independent from the existing `JudgeLLM`
+  so callers can use a cheaper / smaller / different-vendor model for
+  the bulk content check.
+- **`HTTPContentFetcher`** — stdlib-only default backed by
+  `urllib.request` + `html.parser`. Strips `<script>` / `<style>` /
+  `<head>`, decodes UTF-8 with replacement, truncates to configurable
+  byte and character budgets to keep judge prompts bounded.
+
+### Changed
+
+- `Graph.__init__` accepts new `content_fetcher=` and `support_judge=`
+  keywords. Both must be supplied together — passing only one raises
+  `ValueError` because content judgement requires both a transport and
+  a verdict source. When both are supplied, a `SourceContentGate` is
+  inserted after the existing `FactCheckGate` (and after
+  `SourceFetchGate` when that one is also configured).
+- The internal gate-routing functions have been refactored into a
+  single `_make_gate_router(next_on_pass)` factory and a dynamic
+  `_gate_chain` / `_wire_gate_chain` pair. The four valid
+  combinations of `source_fetcher` × `(content_fetcher, support_judge)`
+  are now wired through the same code path.
+
+### Migration notes
+
+This release is backwards-compatible. Existing callers that don't
+configure the new arguments see the same graph topology as 0.11.0,
+including the optional `SourceFetchGate`. Failures from the new node
+are reported as `FailReason.NO_SOURCE`, the same category used by
+`FactCheckGate` and `SourceFetchGate`, so `DomainConfig` subclasses
+need no changes.
+
+```python
+from hallucination_guard.graph import Graph
+from hallucination_guard.nodes.source_content_gate import (
+    HTTPContentFetcher,
+    SupportJudge,
+)
+
+class LLMSupportJudge:
+    def __init__(self, client, model): ...
+    def supports(self, claim: str, passage: str) -> bool:
+        # Ask any model whether `passage` supports `claim`. Returning
+        # False short-circuits the claim onto the retry path.
+        ...
+
+graph = Graph(
+    domain=...,
+    structured_llm=...,
+    judge_llm=...,
+    content_fetcher=HTTPContentFetcher(timeout=10.0),
+    support_judge=LLMSupportJudge(my_client, "<your-model-id>"),
+)
+```
+
 ## [0.11.0] — 2026-05-15
 
 ### Added
